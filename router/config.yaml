@@ -1,0 +1,40 @@
+# ai-tools router configuration
+#
+# This file maps model names (as they appear in the `model` field of an
+# incoming /v1/messages or /v1/chat/completions request) to backend URLs.
+#
+# Override the path to this file with:
+#   --config /path/to/config.yaml   (CLI flag)
+#   ROUTER_CONFIG=/path/to/config.yaml  (env var)
+#
+# Defaults:
+#   host: 0.0.0.0
+#   port: 8090
+
+# Bind address for the router.
+host: 0.0.0.0
+port: 8090
+
+# Seconds to wait for the backend to produce the first byte. Long-running
+# generations stream, so this only bounds the connect + first-token time.
+request_timeout_s: 120
+
+# How many bytes to read from the backend at a time while streaming.
+read_chunk_size: 4096
+
+# Model name -> backend URL.
+# The URL is the base of the llama.cpp server; the router appends the
+# request path (/v1/messages or /v1/chat/completions) verbatim.
+models:
+  # 27B orchestrator model — used for decomposition and synthesis.
+  llama-27b-orchestrator: "http://evo-x2:8080"
+  # 35B worker model — used for executing individual subtasks.
+  llama-35b-worker: "http://evo-x2:8081"
+  # A few common aliases so clients can use short names.
+  orchestrator: "http://evo-x2:8080"
+  worker: "http://evo-x2:8081"
+
+# Optional: if a request's model name doesn't match any entry above,
+# fall back to this model. Set to null (or omit) to return 404 on unknown
+# models instead.
+default_model: orchestrator
