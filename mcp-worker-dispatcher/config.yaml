@@ -1,0 +1,27 @@
+# Sample config for the mcp-worker-dispatcher HTTP router.
+#
+# Copy this to ~/ai-tools/router/config.yaml (the default lookup location),
+# or pass it explicitly:  python router.py --config /path/to/config.yaml
+#
+#   python router.py --config config.yaml
+
+# Bind address for the router.
+host: 0.0.0.0
+port: 8090
+
+# Seconds to wait for the backend to produce a response. Generations stream,
+# so this bounds the whole request, not just the first token.
+request_timeout_s: 120
+
+# Model name -> backend URL. The URL is the base of a llama.cpp server
+# (host and port only); the router appends the request path verbatim.
+models:
+  # 27B orchestrator model — used for decomposition / synthesis.
+  orchestrator: "http://evo-x2:8080"
+  # 35B worker model — used for executing individual subtasks.
+  worker: "http://evo-x2:8081"
+
+# Optional: if a request's model name doesn't match any entry above,
+# fall back to this model. Set to null (or omit) to return 404 on unknown
+# models instead.
+default_model: null
