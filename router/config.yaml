@@ -23,16 +23,17 @@ request_timeout_s: 120
 read_chunk_size: 4096
 
 # Model name -> backend URL.
-# The URL is the base of the llama.cpp server; the router appends the
-# request path (/v1/messages or /v1/chat/completions) verbatim.
+# The URL is the base of a llama.cpp server (host and port only); the router
+# appends the request path (/v1/messages or /v1/chat/completions) verbatim.
+# Replace each <server_url> with the address of your backend, e.g.
+#   "http://localhost:8080"
+# or
+#   "http://192.168.1.20:8080"
 models:
-  # 27B orchestrator model — used for decomposition and synthesis.
-  llama-27b-orchestrator: "http://evo-x2:8080"
-  # 35B worker model — used for executing individual subtasks.
-  llama-35b-worker: "http://evo-x2:8081"
-  # A few common aliases so clients can use short names.
-  orchestrator: "http://evo-x2:8080"
-  worker: "http://evo-x2:8081"
+  # Example: a larger model for decomposition / synthesis.
+  orchestrator: "<server_url>"
+  # Example: a smaller, faster model for executing individual subtasks.
+  worker: "<server_url>"
 
 # Optional: if a request's model name doesn't match any entry above,
 # fall back to this model. Set to null (or omit) to return 404 on unknown

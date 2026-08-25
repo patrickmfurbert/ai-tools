@@ -16,9 +16,9 @@ URL.
 
 ```
             ┌──────────────┐
-  client ──►│  ai-tools    │──►  evo-x2:8080  (27B orchestrator)
+  client ──►│  ai-tools    │──►  <server_url>  (larger model)
   (Claude   │  router      │
-   Code)    │  :8090       │──►  evo-x2:8081  (35B worker)
+   Code)    │  :8090       │──►  <server_url>  (smaller/faster model)
             └──────────────┘
 ```
 
@@ -45,15 +45,15 @@ this order:
 3. `~/ai-tools/router/config.yaml` (default)
 
 A complete example is in [`config.yaml`](config.yaml). The important
-section is `models`:
+section is `models` — replace each `<server_url>` with the address of a
+llama.cpp backend:
 
 ```yaml
 models:
-  llama-27b-orchestrator: "http://evo-x2:8080"
-  llama-35b-worker:       "http://evo-x2:8081"
-  # short aliases
-  orchestrator: "http://evo-x2:8080"
-  worker:       "http://evo-x2:8081"
+  # a larger model for decomposition / synthesis
+  orchestrator: "http://localhost:8080"
+  # a smaller, faster model for executing individual subtasks
+  worker: "http://192.168.1.20:8081"
 
 # Optional fallback for unknown model names. Omit or set to null to 404.
 default_model: orchestrator
@@ -104,7 +104,7 @@ This is what makes it transparent to Claude Code: the client doesn't know
 Every request logs two lines — the route decision and the completion:
 
 ```
-13:24:44  INFO   router  [1] POST /v1/messages  model=llama-27b-orchestrator  ->  http://evo-x2:8080  (93 bytes)
+13:24:44  INFO   router  [1] POST /v1/messages  model=orchestrator  ->  http://localhost:8080  (93 bytes)
 13:24:44  INFO   router  [1] /v1/messages done  status=200  body=172 bytes  elapsed=70ms
 ```
 

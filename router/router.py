@@ -140,6 +140,13 @@ def load_config(path: Path) -> RouterConfig:
     models: dict[str, str] = {}
     for name, url in models_raw.items():
         if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            # Catch the unfilled template placeholder specifically so the error
+            # points the user at the config instead of a cryptic connect failure.
+            if url == "<server_url>":
+                raise ConfigError(
+                    f"model {name!r} still has the placeholder '<server_url>' — "
+                    "replace it with a real backend URL in the config"
+                )
             raise ConfigError(
                 f"model {name!r} maps to {url!r}; backend URLs must start with http:// or https://"
             )
