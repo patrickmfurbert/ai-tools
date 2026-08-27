@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
 """A lightweight HTTP router for llama.cpp backends.
+
 Sits between an LLM client (e.g. Claude Code) and one or more llama.cpp
 server instances. Reads the ``model`` field from the request body and
 forwards the entire request — headers, body, streaming included — to the
 matching backend, then streams the response back to the caller unchanged.
+
 Only ``/v1/messages`` (Anthropic-style) and ``/v1/chat/completions``
 (OpenAI-style) are handled. Everything else is rejected with a 404.
+
 Usage:
     python router.py                          # port 8090, default config
     python router.py --port 9000 --config /tmp/c.yaml
     ROUTER_CONFIG=/tmp/c.yaml python router.py
+
 The config path resolution order is:
     1. --config CLI flag
     2. ROUTER_CONFIG environment variable
     3. ~/ai-tools/router/config.yaml
+
 The router is intentionally small: stdlib HTTP server, stdlib json/http
 client, PyYAML only for parsing YAML config (toml configs use the stdlib
 tomllib). No web frameworks, no async, no dependency surprises.
 """
+
 from __future__ import annotations
+
 import argparse
 import json
 import logging
@@ -36,8 +43,9 @@ from typing import Any
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
+
 log = logging.getLogger("router")
-RESPONSE_LOG_PATH = Path.home() / "ai-tools" / "router" / "responses.log"
+
 
 def configure_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
@@ -50,32 +58,23 @@ def configure_logging(verbose: bool) -> None:
     log.handlers.clear()
     log.addHandler(handler)
     log.setLevel(level)
+    # Quiet down urllib so we control the noise ourselves.
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-def log_response_body(req_id: int, model: str, path: str, body: bytes) -> None:
-    """Append response body to a debug log file for inspection."""
-    try:
-        RESPONSE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with RESPONSE_LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(f"\n{'='*70}\n")
-            f.write(f"[{req_id}] {time.strftime('%H:%M:%S')}  model={model}  path={path}\n")
-            f.write(f"{'='*70}\n")
-            f.write(body[:4000].decode("utf-8", errors="replace"))
-            if len(body) > 4000:
-                f.write(f"\n... ({len(body) - 4000} bytes truncated)")
-            f.write("\n")
-    except Exception as exc:
-        log.warning("[%d] failed to write response log: %s", req_id, exc)
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+
+
 class ConfigError(Exception):
     """Raised when the config file is missing, unparseable, or invalid."""
+
 
 @dataclass
 class RouterConfig:
     """Resolved router configuration."""
+
     host: str
     port: int
     models: dict[str, str] = field(default_factory=dict)
@@ -85,17 +84,27 @@ class RouterConfig:
     source_path: Path | None = None
 
     def resolve_backend(self, model: str) -> str | None:
+        """Return the backend URL for ``model``, falling back to the default."""
         if model in self.models:
             return self.models[model]
         if self.default_model is not None and self.default_model in self.models:
             return self.models[self.default_model]
         return None
 
+
 def load_config(path: Path) -> RouterConfig:
+    """Parse a YAML or TOML config file into a RouterConfig.
+
+    The file extension decides the parser; YAML is the default. Unknown
+    extensions raise ConfigError so a typo'd path doesn't silently fall
+    through.
+    """
     if not path.exists():
         raise ConfigError(f"config file not found: {path}")
+
     raw = path.read_text(encoding="utf-8")
     data: dict[str, Any]
+
     suffix = path.suffix.lower()
     if suffix in (".yaml", ".yml"):
         try:
@@ -120,11 +129,14 @@ def load_config(path: Path) -> RouterConfig:
             f"unsupported config extension {suffix!r} for {path}; "
             "use .yaml, .yml, or .toml"
         )
+
     if not isinstance(data, dict):
         raise ConfigError(f"top level of {path} must be a mapping")
+
     models_raw = data.get("models", {})
     if not isinstance(models_raw, dict):
         raise ConfigError("'models' must be a mapping of model name -> backend URL")
+
     models: dict[str, str] = {}
     for name, url in models_raw.items():
         if not isinstance(url, str) or not url.startswith(("http://", "https://")):
@@ -137,23 +149,29 @@ def load_config(path: Path) -> RouterConfig:
                 f"model {name!r} maps to {url!r}; backend URLs must start with http:// or https://"
             )
         models[str(name)] = url.rstrip("/")
+
     host = data.get("host", "0.0.0.0")
     if not isinstance(host, str):
         raise ConfigError("'host' must be a string")
+
     port = data.get("port", 8090)
     if not isinstance(port, int) or not (1 <= port <= 65535):
         raise ConfigError("'port' must be an integer between 1 and 65535")
+
     default_model = data.get("default_model")
     if default_model is not None and default_model not in models:
         raise ConfigError(
             f"default_model {default_model!r} is not in the models mapping"
         )
+
     request_timeout_s = data.get("request_timeout_s", 120.0)
     if not isinstance(request_timeout_s, (int, float)) or request_timeout_s <= 0:
         raise ConfigError("'request_timeout_s' must be a positive number")
+
     read_chunk_size = data.get("read_chunk_size", 4096)
     if not isinstance(read_chunk_size, int) or read_chunk_size <= 0:
         raise ConfigError("'read_chunk_size' must be a positive integer")
+
     return RouterConfig(
         host=host,
         port=port,
@@ -164,7 +182,9 @@ def load_config(path: Path) -> RouterConfig:
         source_path=path,
     )
 
+
 def resolve_config_path(flag: str | None) -> Path:
+    """Apply the CLI > env > default resolution order for the config path."""
     if flag:
         return Path(flag).expanduser()
     env = os.environ.get("ROUTER_CONFIG")
@@ -172,67 +192,47 @@ def resolve_config_path(flag: str | None) -> Path:
         return Path(env).expanduser()
     return Path.home() / "ai-tools" / "router" / "config.yaml"
 
+
 # ---------------------------------------------------------------------------
-# Tool schema sanitisation
+# Tool schema filtering
 # ---------------------------------------------------------------------------
+
+# Tools that cause llama.cpp's GBNF compiler to blow up due to permutation
+# explosion from optional parameters. zoom_image has 5 optional params
+# (file_path, x1, y1, x2, y2) which generates 5! = 120 permutation rules.
 BLOCKED_TOOLS: frozenset[str] = frozenset({"zoom_image"})
 
-def get_tool_schema(fn: dict) -> dict:
-    """Get tool schema from either OpenAI (parameters) or Anthropic (input_schema) format."""
-    return fn.get("parameters") or fn.get("input_schema") or {}
 
-def strip_max_length(schema: Any) -> Any:
-    """Recursively remove maxLength constraints from a JSON schema."""
-    if isinstance(schema, dict):
-        return {
-            k: strip_max_length(v)
-            for k, v in schema.items()
-            if k != "maxLength"
-        }
-    if isinstance(schema, list):
-        return [strip_max_length(v) for v in schema]
-    return schema
+def filter_tools(parsed: dict) -> tuple[dict, list[str]]:
+    """Remove tools that trigger llama.cpp grammar compilation bugs.
 
-def sanitise_tools(parsed: dict) -> tuple[dict, list[str], bool]:
-    """Remove blocked tools and strip maxLength from all tool schemas.
-    Handles both OpenAI format (parameters) and Anthropic format (input_schema).
+    Returns the (possibly modified) parsed dict and a list of removed tool names.
     """
     tools = parsed.get("tools")
     if not tools:
-        return parsed, [], False
+        return parsed, []
+
     filtered = []
     removed = []
-    schemas_modified = False
     for t in tools:
         fn = t.get("function", t)
         name = fn.get("name", "")
         if name in BLOCKED_TOOLS:
             removed.append(name)
-            continue
-        schema_key = "parameters" if "parameters" in fn else (
-            "input_schema" if "input_schema" in fn else None
-        )
-        if schema_key:
-            params = fn.get(schema_key)
-            if params:
-                cleaned = strip_max_length(params)
-                if cleaned != params:
-                    schemas_modified = True
-                    t = dict(t)
-                    if "function" in t:
-                        t["function"] = dict(t["function"])
-                        t["function"][schema_key] = cleaned
-                    else:
-                        t[schema_key] = cleaned
-        filtered.append(t)
-    if removed or schemas_modified:
+        else:
+            filtered.append(t)
+
+    if removed:
         parsed = dict(parsed)
         parsed["tools"] = filtered
-    return parsed, removed, schemas_modified
+
+    return parsed, removed
+
 
 # ---------------------------------------------------------------------------
 # Upstream proxying
 # ---------------------------------------------------------------------------
+
 HOP_BY_HOP = frozenset(
     {
         "connection",
@@ -248,13 +248,16 @@ HOP_BY_HOP = frozenset(
     }
 )
 
+
 class UpstreamError(Exception):
     """Raised when the backend is unreachable or returns a non-2xx status."""
+
     def __init__(self, status: int, body: bytes, reason: str = ""):
         super().__init__(f"upstream returned HTTP {status}: {reason or body[:200]!r}")
         self.status = status
         self.body = body
         self.reason = reason
+
 
 def open_upstream(
     backend_url: str,
@@ -264,6 +267,7 @@ def open_upstream(
     body: bytes,
     timeout_s: float,
 ) -> Any:
+    """Open the backend request and return a readable response object."""
     url = backend_url + path_with_query
     req_headers = {
         k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP
@@ -271,6 +275,7 @@ def open_upstream(
     if body:
         req_headers["content-length"] = str(len(body))
     req_headers.pop("expect", None)
+
     req = urllib.request.Request(url, data=body, method=method, headers=req_headers)
     try:
         resp = urllib.request.urlopen(req, timeout=timeout_s)
@@ -281,14 +286,19 @@ def open_upstream(
         raise UpstreamError(0, b"", str(exc.reason)) from exc
     return resp
 
+
 # ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
+
+
 class RouterHandler(BaseHTTPRequestHandler):
     """Handles a single client connection and proxies it upstream."""
+
     config: RouterConfig = None  # type: ignore[assignment]
     request_counter: int = 0
     _counter_lock = threading.Lock()
+
     server_version = "ai-tools-router/1.0"
     protocol_version = "HTTP/1.1"
 
@@ -332,6 +342,7 @@ class RouterHandler(BaseHTTPRequestHandler):
     def handle_request(self, method: str) -> None:
         req_id = self._next_id()
         started = time.monotonic()
+
         allowed_paths = {"/v1/messages", "/v1/chat/completions"}
         path = self.path.split("?", 1)[0]
         if path not in allowed_paths:
@@ -340,22 +351,28 @@ class RouterHandler(BaseHTTPRequestHandler):
                 f"path {path!r} is not proxied; supported: {sorted(allowed_paths)}",
             )
             return
+
         body = self._read_request_body()
         if not body:
             self._send_json_error(400, "empty request body")
             return
+
         try:
             parsed = json.loads(body.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             self._send_json_error(400, f"request body is not valid JSON: {exc}")
             return
+
         if not isinstance(parsed, dict):
             self._send_json_error(400, "request body must be a JSON object")
             return
+
         model = parsed.get("model")
+
         if not model or not isinstance(model, str):
             self._send_json_error(400, "request body must include a string 'model' field")
             return
+
         backend = self.config.resolve_backend(model)
         if backend is None:
             known = ", ".join(sorted(self.config.models)) or "(none)"
@@ -364,33 +381,37 @@ class RouterHandler(BaseHTTPRequestHandler):
                 f"no backend configured for model {model!r}; known models: {known}",
             )
             return
-        # Log tool schema sizes — handles both OpenAI (parameters) and
-        # Anthropic (input_schema) tool formats.
+
+        # Log tool schema sizes.
         tools = parsed.get("tools", [])
         tool_summary = []
         for t in tools:
             fn = t.get("function", t)
             name = fn.get("name", "?")
-            schema = get_tool_schema(fn)
-            schema_bytes = len(json.dumps(schema))
+            schema_bytes = len(json.dumps(fn.get("parameters", {})))
             tool_summary.append(f"{name}={schema_bytes}B")
         log.info(
             "[%d] tools=%d  total_body=%dB  schemas: %s",
             req_id, len(tools), len(body),
             ", ".join(tool_summary) if tool_summary else "(none)",
         )
-        # Sanitise tool schemas for llama.cpp GBNF compatibility.
-        parsed, removed, schemas_modified = sanitise_tools(parsed)
+
+        # Strip tools that cause llama.cpp GBNF grammar compilation to fail.
+        parsed, removed = filter_tools(parsed)
         if removed:
-            log.info("[%d] blocked tools: %s", req_id, ", ".join(removed))
-        if schemas_modified:
-            log.info("[%d] stripped maxLength constraints from tool schemas", req_id)
-        if removed or schemas_modified:
+            log.info("[%d] stripped tools: %s", req_id, ", ".join(removed))
             body = json.dumps(parsed).encode("utf-8")
+
         log.info(
             "[%d] %s %s  model=%s  ->  %s  (%d bytes)",
-            req_id, method, path, model, backend, len(body),
+            req_id,
+            method,
+            path,
+            model,
+            backend,
+            len(body),
         )
+
         # Forward.
         try:
             resp = open_upstream(
@@ -413,12 +434,15 @@ class RouterHandler(BaseHTTPRequestHandler):
                 )
                 self._send_response(exc.status, exc.body, self._content_type_from_headers())
             return
+
         status = resp.status
         reason = resp.reason or ""
         ctype = resp.headers.get("content-type", "application/json")
+
         is_streaming = ctype.startswith("text/event-stream") or (
             "transfer-encoding" in {k.lower() for k in resp.headers}
         )
+
         if is_streaming:
             self.send_response(status)
             self.send_header("content-type", ctype)
@@ -426,8 +450,8 @@ class RouterHandler(BaseHTTPRequestHandler):
             self.send_header("connection", "close")
             self.close_connection = True
             self.end_headers()
+
             bytes_sent = 0
-            response_sample = bytearray()
             try:
                 while True:
                     chunk = resp.read(self.config.read_chunk_size)
@@ -435,25 +459,27 @@ class RouterHandler(BaseHTTPRequestHandler):
                         break
                     self.wfile.write(chunk)
                     bytes_sent += len(chunk)
-                    # Capture first 4000 bytes for response log
-                    if len(response_sample) < 4000:
-                        response_sample.extend(chunk)
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError) as exc:
                 log.warning(
                     "[%d] client disconnected mid-stream (%s); sent %d bytes",
-                    req_id, type(exc).__name__, bytes_sent,
+                    req_id,
+                    type(exc).__name__,
+                    bytes_sent,
                 )
             finally:
                 resp.close()
-            # Log response sample
-            log_response_body(req_id, model, path, bytes(response_sample))
             elapsed_ms = (time.monotonic() - started) * 1000
             log.info(
                 "[%d] %s done  status=%d  streamed=%d bytes  elapsed=%.0fms",
-                req_id, path, status, bytes_sent, elapsed_ms,
+                req_id,
+                path,
+                status,
+                bytes_sent,
+                elapsed_ms,
             )
             return
+
         # Non-streaming: buffer the whole body.
         try:
             full_body = resp.read()
@@ -462,37 +488,49 @@ class RouterHandler(BaseHTTPRequestHandler):
             log.error("[%d] error reading upstream body: %s", req_id, exc)
             self._send_json_error(502, f"error reading upstream body: {exc}")
             return
-        # Log full response body
-        log_response_body(req_id, model, path, full_body)
+
         self.send_response(status)
         self.send_header("content-type", ctype)
         self.send_header("content-length", str(len(full_body)))
         self.end_headers()
         if full_body:
             self.wfile.write(full_body)
+
         elapsed_ms = (time.monotonic() - started) * 1000
         log.info(
             "[%d] %s done  status=%d  body=%d bytes  elapsed=%.0fms",
-            req_id, path, status, len(full_body), elapsed_ms,
+            req_id,
+            path,
+            status,
+            len(full_body),
+            elapsed_ms,
         )
 
     def _content_type_from_headers(self) -> str:
         return "application/json"
 
+
 # ---------------------------------------------------------------------------
 # Server factory
 # ---------------------------------------------------------------------------
+
+
 def make_server(config: RouterConfig) -> ThreadingHTTPServer:
+    """Build a ThreadingHTTPServer with the config bound to the handler."""
     RouterHandler.config = config
     server = ThreadingHTTPServer((config.host, config.port), RouterHandler)
     server.daemon_threads = True
     return server
 
+
 def serve(config: RouterConfig) -> int:
+    """Run the router until interrupted. Returns a process exit code."""
     server = make_server(config)
     log.info(
         "router listening on %s:%d  (config=%s)",
-        config.host, config.port, config.source_path,
+        config.host,
+        config.port,
+        config.source_path,
     )
     for model, backend in config.models.items():
         log.info("  %-32s -> %s", model, backend)
@@ -506,9 +544,12 @@ def serve(config: RouterConfig) -> int:
         server.server_close()
     return 0
 
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Route LLM API requests to llama.cpp backends by model name."
@@ -527,26 +568,32 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Override the bind port from the config file (default 8090).",
     )
     parser.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="Enable debug logging.",
     )
     return parser.parse_args(argv)
 
+
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     configure_logging(args.verbose)
+
     config_path = resolve_config_path(args.config)
     try:
         config = load_config(config_path)
     except ConfigError as exc:
         log.error("config error: %s", exc)
         return 2
+
     if args.host:
         config.host = args.host
     if args.port:
         config.port = args.port
+
     return serve(config)
+
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
