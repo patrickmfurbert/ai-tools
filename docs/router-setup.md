@@ -148,7 +148,3 @@ router listening on 0.0.0.0:8090  (config=/home/pastrycak3s/ai-tools/router/conf
 4. Use the name: `curl localhost:8090/v1/chat/completions -d '{"model": "coder", ...}'`,
    or add a matching `strategist()`-style shell function
    ([client-setup.md](client-setup.md)).
-
-The MCP dispatcher (`mcp-worker-dispatcher/`, see
-[its README](../mcp-worker-dispatcher/README.md)) picks new names up
-automatically via `list_models()`, which reads this same config file.
