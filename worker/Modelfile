@@ -1,0 +1,34 @@
+# Worker model served to Claude Code sub-agents via the router.
+#
+# The `worker` name is what the router forwards (models.worker in
+# router/config.yaml), and the router proxies /v1/chat/completions verbatim.
+#
+# Why num_ctx is baked in here rather than sent per request:
+# Ollama's OpenAI-compatible endpoint has no way to accept num_ctx per request,
+# and Claude Code sends none. Without this PARAMETER the model serves at
+# Ollama's 4096-token default despite a 262144 native window, prompts get
+# silently truncated, and the model burns the rest of the window returning an
+# empty completion with no error raised. See README.md for the measurements.
+#
+# Deploy: see README.md. Changing this file requires `ollama create` again and
+# an Ollama-Serve restart; Ollama has no reload.
+
+FROM qwen3.5:4b
+
+# 32768 costs 5.6 GB of the 8.2 GB card (measured ~33 MiB per 1k tokens, on top
+# of ~3.1 GB resident). Sized for headroom, not for the model's ceiling.
+#
+# Ollama allocates a KV cache per *parallel slot*, and this cannot be pinned
+# here: num_parallel is not a valid model PARAMETER (Ollama rejects it with
+# "unknown parameter 'num_parallel'"). It is the server-level
+# OLLAMA_NUM_PARALLEL env var, which auto-selects 1 or 4 by available memory. If
+# this model ever OOMs or spills to CPU under concurrent requests, that env var
+# on the Ollama-Serve task is what to set to 1 — not this file.
+PARAMETER num_ctx 32768
+
+# Sampling values carried over from the qwen3.5:4b defaults the worker was
+# evaluated with; not chosen here.
+PARAMETER temperature 1
+PARAMETER top_k 20
+PARAMETER top_p 0.95
+PARAMETER presence_penalty 1.5
