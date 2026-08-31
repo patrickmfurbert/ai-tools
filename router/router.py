@@ -9,6 +9,8 @@ Only ``/v1/messages`` (Anthropic-style) and ``/v1/chat/completions``
 Usage:
     python router.py                          # port 8090, default config
     python router.py --port 9000 --config /tmp/c.yaml
+    python router.py --rewrite-context-errors  # translate llama.cpp context-
+                                               # overflow 400s into Anthropic shape
     ROUTER_CONFIG=/tmp/c.yaml python router.py
 The config path resolution order is:
     1. --config CLI flag
@@ -82,6 +84,8 @@ class RouterConfig:
     default_model: str | None = None
     request_timeout_s: float = 120.0
     read_chunk_size: int = 4096
+    rewrite_context_errors: bool = False
+    prompt_guards: dict[str, int] = field(default_factory=dict)
     source_path: Path | None = None
 
     def resolve_backend(self, model: str) -> str | None:
@@ -282,6 +286,98 @@ def open_upstream(
     return resp
 
 # ---------------------------------------------------------------------------
+# Context-overflow error translation (opt-in: --rewrite-context-errors)
+# ---------------------------------------------------------------------------
+def translate_context_error(body: bytes) -> bytes | None:
+    """Translate a llama.cpp context-overflow 400 into the Anthropic error shape.
+
+    llama.cpp answers an oversized prompt with::
+
+        {"error": {"code": 400,
+                   "message": "request (N tokens) exceeds the available context size (M tokens), try increasing it",
+                   "type": "exceed_context_size_error",
+                   "n_prompt_tokens": N, "n_ctx": M}}
+
+    Clients like Claude Code only learn the real backend window from the
+    Anthropic-shaped ``prompt is too long: N tokens > M maximum`` phrasing;
+    with anything else they just report the error and the session dead-ends,
+    because every retry — /compact included — resends the same oversized
+    history. Rewritten bodies carry the real numbers so the client can shrink
+    its assumed window and compact reactively. Returns None when the body is
+    not that error, so the caller relays the upstream response untouched.
+    """
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    err = payload.get("error")
+    if not isinstance(err, dict) or err.get("type") != "exceed_context_size_error":
+        return None
+    n_prompt = err.get("n_prompt_tokens")
+    n_ctx = err.get("n_ctx")
+    if isinstance(n_prompt, int) and isinstance(n_ctx, int):
+        message = f"prompt is too long: {n_prompt} tokens > {n_ctx} maximum"
+    else:
+        message = "prompt is too long: the prompt exceeds the backend context size"
+    return json.dumps(
+        {
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": message},
+        }
+    ).encode("utf-8")
+
+# ---------------------------------------------------------------------------
+# Prompt-size guard for silent-truncating backends (opt-in: --prompt-guard)
+# ---------------------------------------------------------------------------
+# Ollama never rejects an oversized prompt: every endpoint (native /api/chat,
+# OpenAI /v1/chat/completions, Anthropic /v1/messages) answers HTTP 200 with
+# the prompt silently truncated to fit — verified live on Ollama 0.33.2, even
+# with truncate:false. There is no error to translate, so the client-facing
+# signal must be produced here, before the backend sees the request. The 400
+# carries the same Anthropic phrasing the translator emits so Claude Code
+# learns the real window and compacts reactively instead of receiving an
+# answer computed from a silently amputated context.
+_SKIP_KEYS = frozenset({"data", "image", "image_url", "audio", "source", "video"})
+
+def _harvest_text(obj: Any, out: list[str]) -> None:
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            if key in _SKIP_KEYS:
+                continue
+            _harvest_text(val, out)
+    elif isinstance(obj, list):
+        for val in obj:
+            _harvest_text(val, out)
+    elif isinstance(obj, str):
+        out.append(obj)
+
+def estimate_prompt_tokens(parsed: dict) -> int:
+    """Estimate request size in tokens as chars/3 over all text content.
+
+    Deliberately generous: English runs ~4 chars/token under the Qwen
+    tokenizer, so chars/3 over-counts ordinary text and the guard fires
+    slightly early rather than after truncation has already happened. Tool
+    schemas and system prompt are counted (they are part of the prompt);
+    base64 blobs are skipped because chars/3 wildly miscounts them.
+    """
+    texts: list[str] = []
+    _harvest_text(parsed, texts)
+    return sum(len(t) for t in texts) // 3
+
+def too_long_response(estimated_tokens: int, limit: int) -> bytes:
+    return json.dumps(
+        {
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": f"prompt is too long: {estimated_tokens} tokens > {limit} maximum",
+            },
+        }
+    ).encode("utf-8")
+
+# ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 class RouterHandler(BaseHTTPRequestHandler):
@@ -364,6 +460,21 @@ class RouterHandler(BaseHTTPRequestHandler):
                 f"no backend configured for model {model!r}; known models: {known}",
             )
             return
+        # Prompt guard: reject oversized prompts for backends that truncate
+        # silently instead of erroring, so the client can compact instead.
+        guard_limit = self.config.prompt_guards.get(model)
+        if guard_limit:
+            est = estimate_prompt_tokens(parsed)
+            if est >= guard_limit:
+                log.warning(
+                    "[%d] prompt-guard: model=%s est=%d tokens >= limit=%d — "
+                    "rejecting so the client compacts instead of truncating",
+                    req_id, model, est, guard_limit,
+                )
+                self._send_response(
+                    400, too_long_response(est, guard_limit), "application/json"
+                )
+                return
         # Log tool schema sizes — handles both OpenAI (parameters) and
         # Anthropic (input_schema) tool formats.
         tools = parsed.get("tools", [])
@@ -411,7 +522,16 @@ class RouterHandler(BaseHTTPRequestHandler):
                 log.warning(
                     "[%d] upstream %s returned HTTP %d", req_id, backend, exc.status
                 )
-                self._send_response(exc.status, exc.body, self._content_type_from_headers())
+                body_out = exc.body
+                if self.config.rewrite_context_errors:
+                    rewritten = translate_context_error(exc.body)
+                    if rewritten is not None:
+                        log.info(
+                            "[%d] rewrote context-overflow error to Anthropic shape",
+                            req_id,
+                        )
+                        body_out = rewritten
+                self._send_response(exc.status, body_out, self._content_type_from_headers())
             return
         status = resp.status
         reason = resp.reason or ""
@@ -531,6 +651,33 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Enable debug logging.",
     )
+    parser.add_argument(
+        "--rewrite-context-errors",
+        action="store_true",
+        help=(
+            "Translate a llama.cpp 'exceed_context_size_error' 400 into the "
+            "Anthropic error shape ('prompt is too long: N tokens > M maximum'). "
+            "Off by default: without it the upstream error is relayed verbatim. "
+            "Claude Code only learns the real backend window from the Anthropic "
+            "phrasing, so enabling this lets it shrink its assumed window and "
+            "compact instead of dead-ending on long sessions."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-guard",
+        action="append",
+        default=[],
+        metavar="MODEL=LIMIT",
+        help=(
+            "Reject requests to MODEL whose estimated prompt size reaches "
+            "LIMIT tokens (estimated as chars/3 over text content) with the "
+            "Anthropic 'prompt is too long: N tokens > M maximum' 400, "
+            "without forwarding. For backends that silently truncate oversized "
+            "prompts (Ollama) instead of erroring — the client never learns "
+            "from a silent amputation. Repeatable: --prompt-guard worker=16386. "
+            "Off for models not listed."
+        ),
+    )
     return parser.parse_args(argv)
 
 def main(argv: list[str]) -> int:
@@ -546,6 +693,18 @@ def main(argv: list[str]) -> int:
         config.host = args.host
     if args.port:
         config.port = args.port
+    config.rewrite_context_errors = args.rewrite_context_errors
+    if config.rewrite_context_errors:
+        log.info("context-overflow error rewriting: ON")
+    for entry in args.prompt_guard:
+        model, sep, limit = entry.rpartition("=")
+        if not sep or not model or not limit.isdigit():
+            log.error("bad --prompt-guard %r; expected MODEL=LIMIT", entry)
+            return 2
+        config.prompt_guards[model] = int(limit)
+    if config.prompt_guards:
+        guards = ", ".join(f"{m}<{lim}" for m, lim in sorted(config.prompt_guards.items()))
+        log.info("prompt guards: ON (%s)", guards)
     return serve(config)
 
 if __name__ == "__main__":
